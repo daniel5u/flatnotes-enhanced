@@ -28,8 +28,9 @@
     confirmButtonStyle="success"
     rejectButtonText="Discard"
     rejectButtonStyle="danger"
-    @confirm="saveHandler((close = true))"
-    @reject="closeNote"
+    @confirm="saveChangesConfirmHandler"
+    @reject="saveChangesRejectHandler"
+    @cancel="saveChangesCancelHandler"
   />
 
   <!-- Draft Modal -->
@@ -119,6 +120,7 @@
       <!-- Content -->
       <div class="flex-1 min-h-0">
         <ToastEditor
+          :key="editorKey"
           ref="toastEditor"
           :initialValue="getInitialEditorValue()"
           :initialEditType="loadDefaultEditorMode()"
@@ -330,12 +332,16 @@ const isNewNote = computed(() => !props.title);
 const isArchivedNote = computed(() => note.value.title?.startsWith("_archive/"));
 const loadingIndicator = ref();
 const note = ref({});
+const editorKey = ref(0);
+const pendingNavigationTitle = ref(null);
 const reservedFilenameCharacters = /[<>"\\|?*]/; // slash allowed
 const router = useRouter();
 const newTitle = ref();
 const toast = useToast();
 const toastEditor = ref();
 const unsavedChanges = ref(false);
+let restoringCurrentRoute = false;
+let discardingPendingNavigation = false;
 
 // ── Folder navigation state ───────────────────────────────────────────────────
 const folderNotes = ref([]);
@@ -520,6 +526,7 @@ async function init() {
     getNote(props.title)
   .then((data) => {
     note.value = data;
+    syncEditStateForLoadedNote();
     loadingIndicator.value.setLoaded();
     loadFolderNotes();
 
@@ -561,6 +568,7 @@ async function init() {
     // Set content immediately for the editor
     note.value.content = initialContent;
     editMode.value = false;
+    editorKey.value++;
     nextTick(() => {
       editHandler();
       loadingIndicator.value.setLoaded();
@@ -596,6 +604,17 @@ function setEditMode() {
   newTitle.value = note.value.title;
   unsavedChanges.value = false;
   editMode.value = true;
+}
+
+function syncEditStateForLoadedNote() {
+  if (!editMode.value) {
+    return;
+  }
+  newTitle.value = note.value.title;
+  unsavedChanges.value = false;
+  clearContentChangedTimeout();
+  setBeforeUnloadConfirmation(false);
+  editorKey.value++;
 }
 
 function getInitialEditorValue() {
@@ -648,7 +667,7 @@ function unarchiveHandler() {
     });
 }
 
-function saveHandler(close = false) {
+function saveHandler(close = false, navigateTo = null) {
   saveDefaultEditorMode();
 
   if (!newTitle.value) {
@@ -665,13 +684,13 @@ function saveHandler(close = false) {
 
   let newContent = toastEditor.value.getMarkdown();
   if (isNewNote.value) {
-    saveNew(newTitle.value, newContent, close);
+    saveNew(newTitle.value, newContent, close, navigateTo);
   } else {
-    saveExisting(newTitle.value, newContent, close);
+    saveExisting(newTitle.value, newContent, close, navigateTo);
   }
 }
 
-function saveNew(newTitle, newContent, close = false) {
+function saveNew(newTitle, newContent, close = false, navigateTo = null) {
   createNote(newTitle, newContent)
     .then((data) => {
       clearDraft();
@@ -679,7 +698,7 @@ function saveNew(newTitle, newContent, close = false) {
       router
         .push({
           name: "note",
-          params: { title: note.value.title },
+          params: { title: navigateTo || note.value.title },
         })
         .then(() => {
           noteSaveSuccess(close);
@@ -689,8 +708,11 @@ function saveNew(newTitle, newContent, close = false) {
     .catch(noteSaveFailure);
 }
 
-function saveExisting(newTitle, newContent, close = false) {
+function saveExisting(newTitle, newContent, close = false, navigateTo = null) {
   if (newTitle == note.value.title && newContent == note.value.content) {
+    if (navigateTo) {
+      router.push({ name: "note", params: { title: navigateTo } });
+    }
     noteSaveSuccess(close);
     return;
   }
@@ -699,9 +721,13 @@ function saveExisting(newTitle, newContent, close = false) {
     .then((data) => {
       clearDraft();
       note.value = data;
-      router.replace({ name: "note", params: { title: note.value.title } });
-      noteSaveSuccess(close);
-      loadFolderNotes();
+      const routeAction = navigateTo
+        ? router.push({ name: "note", params: { title: navigateTo } })
+        : router.replace({ name: "note", params: { title: note.value.title } });
+      routeAction.then(() => {
+        noteSaveSuccess(close);
+        loadFolderNotes();
+      });
     })
     .catch(noteSaveFailure);
 }
@@ -737,6 +763,36 @@ function closeHandler() {
   } else {
     closeNote();
   }
+}
+
+function saveChangesConfirmHandler() {
+  const targetTitle = pendingNavigationTitle.value;
+  pendingNavigationTitle.value = null;
+  saveHandler(targetTitle ? false : true, targetTitle);
+}
+
+function saveChangesRejectHandler() {
+  const targetTitle = pendingNavigationTitle.value;
+  pendingNavigationTitle.value = null;
+  clearContentChangedTimeout();
+  clearDraft();
+  unsavedChanges.value = false;
+  setBeforeUnloadConfirmation(false);
+
+  if (targetTitle) {
+    discardingPendingNavigation = true;
+    router
+      .push({ name: "note", params: { title: targetTitle } })
+      .finally(() => {
+        discardingPendingNavigation = false;
+      });
+  } else {
+    closeNote();
+  }
+}
+
+function saveChangesCancelHandler() {
+  pendingNavigationTitle.value = null;
 }
 
 function closeNote() {
@@ -909,6 +965,44 @@ function isContentChanged() {
   );
 }
 
-watch(() => props.title, init);
+function hasUnsavedChanges() {
+  return editMode.value && toastEditor.value && isContentChanged();
+}
+
+function restoreRouteToCurrentNote() {
+  if (!note.value.title) {
+    return;
+  }
+  restoringCurrentRoute = true;
+  router
+    .replace({ name: "note", params: { title: note.value.title } })
+    .finally(() => {
+      restoringCurrentRoute = false;
+    });
+}
+
+function titleChangeHandler(nextTitle) {
+  if (restoringCurrentRoute) {
+    return;
+  }
+
+  if (
+    !discardingPendingNavigation &&
+    editMode.value &&
+    note.value.title &&
+    nextTitle &&
+    nextTitle !== note.value.title &&
+    hasUnsavedChanges()
+  ) {
+    pendingNavigationTitle.value = nextTitle;
+    isSaveChangesModalVisible.value = true;
+    restoreRouteToCurrentNote();
+    return;
+  }
+
+  init();
+}
+
+watch(() => props.title, titleChangeHandler);
 onMounted(init);
 </script>
