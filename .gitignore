@@ -248,3 +248,6 @@ dist
 .vscode/
 data/
 /notes/
+
+# SSH Key
+.github_action_key
